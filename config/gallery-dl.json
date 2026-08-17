@@ -1,0 +1,30 @@
+{
+    "extractor": {
+        "base-directory": "./downloads",
+
+        "archive": "./archive/downloads.sqlite3",
+
+        "archive-pragma": [
+            "journal_mode=WAL",
+            "synchronous=NORMAL"
+        ],
+
+        "retries": 4,
+        "timeout": 30,
+
+        "facebook": {
+            "videos": true
+        },
+
+        "instagram": {
+            "videos": true,
+            "audio": true,
+            "cursor": true,
+            "previews": false,
+            "order-posts": "desc",
+            "order-files": "asc",
+            "user-cache": "disk",
+            "sleep-request": "6.0-12.0"
+        }
+    }
+}
