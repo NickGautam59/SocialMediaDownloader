@@ -6,11 +6,12 @@ from pathlib import Path
 import json
 import os
 import re
-import subprocess
-import sys
-import tempfile
-from typing import Any
+from contextlib import contextmanager
 from urllib.parse import urlparse
+
+from gallery_dl import config, job
+from gallery_dl.extractor.common import Message
+import gallery_dl
 
 
 @dataclass(frozen=True)
@@ -20,7 +21,6 @@ class MediaItem:
     date: datetime | None
     media_id: str
     extension: str = "jpg"
-    path: str | None = None
 
 
 @dataclass
@@ -42,15 +42,9 @@ class DownloadStats:
 
 
 class GalleryDLInstagramEngine:
-    """Instagram V2 engine built around the maintained gallery-dl extractor.
+    """Instagram V2 engine using gallery-dl directly as a Python library."""
 
-    The application never asks for an Instagram password. Public profiles are
-    attempted anonymously first. If Instagram requires authentication,
-    gallery-dl is allowed to read an existing browser session without storing
-    the password or exporting cookies into this project.
-    """
-
-    def __init__(self) -> None:
+    def __init__(self):
         self.root = Path(__file__).resolve().parents[2]
         self.download_root = self.root / "downloads" / "Instagram"
         self.data_root = self.root / "data"
@@ -58,28 +52,8 @@ class GalleryDLInstagramEngine:
         self.state_file = self.data_root / "instagram_state.json"
         self.download_root.mkdir(parents=True, exist_ok=True)
         self.data_root.mkdir(parents=True, exist_ok=True)
-        self.auth_mode: str | None = None
-        self._gallery_version: str | None = None
-        self._ensure_gallery_dl()
-
-    def _ensure_gallery_dl(self) -> None:
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "gallery_dl", "--version"],
-                capture_output=True, text=True, timeout=30,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(
-                "gallery-dl is not installed. Run: py -m pip install -r "
-                "requirements-instagram-v2.txt"
-            ) from exc
-        if result.returncode != 0:
-            raise RuntimeError(
-                "gallery-dl is not available. Run: py -m pip install -r "
-                "requirements-instagram-v2.txt"
-            )
-        self._gallery_version = (result.stdout or result.stderr).strip().splitlines()[0]
+        self.auth_mode = None
+        self.gallery_version = gallery_dl.__version__
 
     @staticmethod
     def normalize_profile(value: str) -> str:
@@ -100,167 +74,115 @@ class GalleryDLInstagramEngine:
             raise ValueError("Invalid Instagram username.")
         return username
 
-    def _profile_url(self, username: str) -> str:
-        return f"https://www.instagram.com/{username}/"
-
-    def _browser_auth_variants(self) -> list[str]:
-        variants = ["brave", "chrome", "edge", "firefox"]
-        if os.name == "nt":
-            local = os.environ.get("LOCALAPPDATA", "")
-            beta = Path(local) / "BraveSoftware" / "Brave-Browser-Beta" / "User Data" / "Default"
-            if beta.exists():
-                variants.insert(1, f"brave:{beta}")
-        return variants
-
-    def _base_args(self) -> list[str]:
-        return [
-            sys.executable, "-m", "gallery_dl",
-            "--no-input",
-            "--no-colors",
-            "-o", "extractor.instagram.videos=false",
-            "-o", "extractor.instagram.audio=false",
-            "-o", "extractor.instagram.previews=false",
-            "-o", "extractor.instagram.base-directory=" + str(self.download_root),
-            "-o", 'extractor.instagram.directory=["{username}","Posts"]',
-            "-o", 'extractor.instagram.filename="{post_date:%Y-%m-%d_%H-%M-%S}_{post_shortcode}_{num}.{extension}"',
-            "--restrict-filenames", "windows",
-        ]
-
-    def _run(self, args: list[str], timeout: int = 900) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-
     @staticmethod
-    def _looks_auth_related(output: str) -> bool:
-        text = output.lower()
-        markers = (
-            "redirect to login",
-            "login page",
-            "login required",
-            "401",
-            "unauthorized",
-            "challenge",
-            "checkpoint",
-            "please wait a few minutes",
-            "private profile",
-            "sessionid",
-        )
-        return any(marker in text for marker in markers)
-
-    def _execute_with_auth_fallback(
-        self, args_without_auth: list[str], timeout: int = 900
-    ) -> subprocess.CompletedProcess[str]:
-        first = self._run(args_without_auth, timeout)
-        if first.returncode == 0:
-            self.auth_mode = "anonymous"
-            return first
-
-        combined = (first.stdout or "") + "\n" + (first.stderr or "")
-        if not self._looks_auth_related(combined):
-            return first
-
-        last = first
-        for browser in self._browser_auth_variants():
-            args = list(args_without_auth)
-            insert_at = args.index("--no-input") + 1
-            args[insert_at:insert_at] = ["--cookies-from-browser", browser]
-            try:
-                result = self._run(args, timeout)
-            except subprocess.SubprocessError as exc:
-                continue
-            last = result
-            if result.returncode == 0:
-                self.auth_mode = f"browser:{browser}"
-                return result
-
-        return last
-
-    @staticmethod
-    def _parse_datetime(value: Any) -> datetime | None:
+    def _parse_datetime(value):
         if value is None:
             return None
         if isinstance(value, (int, float)):
-            return datetime.fromtimestamp(value, tz=timezone.utc)
+            return datetime.fromtimestamp(value, timezone.utc)
         text = str(value).strip()
-        if not text:
-            return None
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
         try:
             dt = datetime.fromisoformat(text)
         except ValueError:
             return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+    @contextmanager
+    def _config(self, browser=None):
+        config.clear()
+        config.set((), "base-directory", str(self.download_root))
+        config.set((), "directory", ("{username}", "Posts"))
+        config.set((), "filename", "{post_date:%Y-%m-%d_%H-%M-%S}_{post_shortcode}_{num}.{extension}")
+        config.set((), "archive", str(self.archive_file))
+        config.set((), "skip", True)
+        config.set((), "retries", 5)
+        config.set((), "sleep-retries", "2-8")
+        config.set((), "sleep", "1-2")
+        config.set(("extractor", "instagram"), "videos", False)
+        config.set(("extractor", "instagram"), "audio", False)
+        config.set(("extractor", "instagram"), "previews", False)
+        if browser:
+            name, profile = browser
+            config.set((), "cookies", (name, profile, None, None, None))
+        try:
+            yield
+        finally:
+            config.clear()
+
+    def _browser_variants(self):
+        variants = [("brave", None), ("chrome", None), ("edge", None), ("firefox", None)]
+        if os.name == "nt":
+            local = os.environ.get("LOCALAPPDATA", "")
+            beta = Path(local) / "BraveSoftware" / "Brave-Browser-Beta" / "User Data" / "Default"
+            if beta.exists():
+                variants.insert(1, ("brave", str(beta)))
+        return variants
+
+    def _is_auth_error(self, exc) -> bool:
+        text = str(exc).lower()
+        return any(x in text for x in (
+            "login", "unauthorized", "401", "challenge", "checkpoint",
+            "private", "sessionid", "please wait a few minutes"
+        ))
+
+    def _run_data(self, url: str):
+        with self._config():
+            data_job = job.DataJob(url, file=None, resolve=0)
+            status = data_job.run()
+            return status, data_job.data
+
+    def _run_data_with_auth(self, url: str):
+        try:
+            status, data = self._run_data(url)
+            self.auth_mode = "anonymous"
+            return status, data
+        except Exception as first:
+            if not self._is_auth_error(first):
+                raise
+            last = first
+            for browser in self._browser_variants():
+                try:
+                    with self._config(browser):
+                        data_job = job.DataJob(url, file=None, resolve=0)
+                        status = data_job.run()
+                        self.auth_mode = f"browser:{browser[0]}"
+                        return status, data_job.data
+                except Exception as exc:
+                    last = exc
+            raise RuntimeError(
+                "Instagram needs access that could not be obtained anonymously or "
+                "from an existing browser session. No Instagram password was requested."
+            ) from last
 
     @staticmethod
-    def _json_records(stdout: str) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
+    def _records(data):
+        for entry in data or []:
+            if not isinstance(entry, tuple) or len(entry) < 3:
                 continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
+            message, url, metadata = entry[:3]
+            if message != Message.Url or not isinstance(metadata, dict):
                 continue
-            if isinstance(value, dict):
-                records.append(value)
+            yield metadata
+
+    def _scan(self, profile_url):
+        status, data = self._run_data_with_auth(profile_url)
+        records = list(self._records(data))
+        if not records and status:
+            raise RuntimeError("gallery-dl could not extract the Instagram profile.")
         return records
 
-    def _scan_records(self, profile_url: str) -> list[dict[str, Any]]:
-        args = self._base_args() + ["-j", profile_url]
-        result = self._execute_with_auth_fallback(args, timeout=1200)
-        if result.returncode != 0:
-            details = (result.stderr or result.stdout).strip()
-            raise RuntimeError(
-                "Instagram scan failed.\n"
-                + (details[-3000:] if details else "gallery-dl returned an unknown error.")
-            )
-        return self._json_records(result.stdout)
-
-    @staticmethod
-    def _record_to_media(record: dict[str, Any]) -> MediaItem | None:
-        shortcode = str(
-            record.get("post_shortcode")
-            or record.get("shortcode")
-            or ""
-        )
-        media_id = str(record.get("media_id") or record.get("id") or "")
-        post_url = str(record.get("post_url") or "")
-        if not shortcode or not media_id:
-            return None
-        if not post_url:
-            post_url = f"https://www.instagram.com/p/{shortcode}/"
-        extension = str(record.get("extension") or "jpg").lower()
-        return MediaItem(
-            shortcode=shortcode,
-            post_url=post_url,
-            date=GalleryDLInstagramEngine._parse_datetime(
-                record.get("post_date") or record.get("date")
-            ),
-            media_id=media_id,
-            extension=extension,
-        )
-
-    def _archive_text(self) -> str:
+    def _archive_text(self):
         try:
             return self.archive_file.read_text(encoding="utf-8", errors="ignore")
         except FileNotFoundError:
             return ""
 
-    def _archive_has(self, media_id: str) -> bool:
-        return media_id in self._archive_text()
+    def _archived(self, media_id):
+        return str(media_id) in self._archive_text()
 
-    def _save_state(self, username: str, posts: int, media: int) -> None:
+    def _state(self, username, posts, media):
         try:
             state = json.loads(self.state_file.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
@@ -269,164 +191,105 @@ class GalleryDLInstagramEngine:
             "last_scan_utc": datetime.now(timezone.utc).isoformat(),
             "last_scanned_posts": posts,
             "last_scanned_media": media,
-            "auth_mode": self.auth_mode,
-            "gallery_dl": self._gallery_version,
+            "access": self.auth_mode,
+            "gallery_dl": self.gallery_version,
         }
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(self.state_file)
 
-    def preview(
-        self,
-        value: str,
-        start: datetime | None = None,
-        end: datetime | None = None,
-        latest_n: int | None = None,
-        quick_update: bool = False,
-    ) -> tuple[str, list[MediaItem], int]:
+    def preview(self, value, start=None, end=None, latest_n=None, quick_update=False):
         username = self.normalize_profile(value)
-        records = self._scan_records(self._profile_url(username))
+        records = self._scan(f"https://www.instagram.com/{username}/")
+        grouped = {}
 
-        grouped: dict[str, list[MediaItem]] = {}
         for record in records:
-            item = self._record_to_media(record)
-            if item is None:
+            media_id = str(record.get("media_id") or record.get("id") or "")
+            shortcode = str(record.get("post_shortcode") or record.get("shortcode") or "")
+            if not media_id or not shortcode:
                 continue
-            if item.extension in {"mp4", "mov", "m4v", "webm"}:
+            extension = str(record.get("extension") or "jpg").lower()
+            if extension in {"mp4", "mov", "m4v", "webm"} or record.get("video_url"):
                 continue
-            if start and item.date and item.date < start:
+            dt = self._parse_datetime(record.get("post_date") or record.get("date"))
+            if start and dt and dt < start:
                 continue
-            if end and item.date and item.date > end:
+            if end and dt and dt > end:
                 continue
-            if self._archive_has(item.media_id):
+            if self._archived(media_id):
                 continue
-            grouped.setdefault(item.shortcode, []).append(item)
+            item = MediaItem(
+                shortcode=shortcode,
+                post_url=str(record.get("post_url") or f"https://www.instagram.com/p/{shortcode}/"),
+                date=dt,
+                media_id=media_id,
+                extension=extension,
+            )
+            grouped.setdefault(shortcode, []).append(item)
 
-        posts: list[MediaItem] = []
-        for shortcode, items in grouped.items():
-            items.sort(key=lambda x: x.media_id)
-            posts.append(items[0])
-
-        posts.sort(
-            key=lambda x: x.date or datetime.min.replace(tzinfo=timezone.utc),
-            reverse=True,
-        )
-        if quick_update:
-            # Archive filtering already removes downloaded media. This is an
-            # additional safety rule for a partial/interrupted previous run.
-            posts = [p for p in posts if not self._archive_has(p.media_id)]
+        posts = [items[0] for items in grouped.values()]
+        posts.sort(key=lambda x: x.date or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
         if latest_n is not None:
             posts = posts[:latest_n]
+        if quick_update:
+            posts = [p for p in posts if not self._archived(p.media_id)]
 
-        selected_codes = {p.shortcode for p in posts}
-        media_items = [
-            item
-            for code, items in grouped.items()
-            if code in selected_codes
-            for item in items
-        ]
-        media_items.sort(
-            key=lambda x: x.date or datetime.min.replace(tzinfo=timezone.utc),
-            reverse=True,
-        )
-        self._save_state(username, len(selected_codes), len(media_items))
-        return username, posts, len(media_items)
+        selected = {p.shortcode for p in posts}
+        media_total = sum(len(items) for code, items in grouped.items() if code in selected)
+        self._state(username, len(posts), media_total)
+        return username, posts, media_total
 
-    def _write_input_file(self, urls: list[str]) -> Path:
-        handle = tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", suffix=".txt",
-            prefix="instagram_v2_", delete=False
-        )
-        path = Path(handle.name)
-        with handle:
-            for url in urls:
-                handle.write(url + "\n")
-        return path
+    def download_images(self, username, posts, media_total):
+        stats = DownloadStats(len(posts), len(posts), media_total)
+        total = len(posts)
 
-    def download_images(
-        self, username: str, posts: list[MediaItem], media_total: int
-    ) -> DownloadStats:
-        stats = DownloadStats(
-            scanned=len(posts),
-            candidates=len(posts),
-            media_total=media_total,
-        )
-        if not posts:
-            return stats
-
-        input_file = self._write_input_file([p.post_url for p in posts])
-        args = self._base_args() + [
-            "--download-archive", str(self.archive_file),
-            "--filter", "not video_url",
-            "--sleep", "1-2",
-            "--retries", "5",
-            "--sleep-retries", "2-8",
-            "--Print", "file:{_path}",
-            "-i", str(input_file),
-        ]
-        try:
-            result = self._execute_with_auth_fallback(args, timeout=7200)
-            printed_files = [
-                line.strip()[5:]
-                for line in result.stdout.splitlines()
-                if line.strip().startswith("file:")
-            ]
-            for index, path in enumerate(printed_files, 1):
-                print(
-                    f"  [{index}/{media_total}] downloaded | "
-                    f"{Path(path).name}"
-                )
-            if result.returncode != 0:
-                details = (result.stderr or result.stdout).strip()
-                stats.failed = max(1, len(posts))
-                stats.errors.append(details[-3000:] if details else "gallery-dl failed")
-                return stats
-
-            stats.downloaded = len(printed_files)
-            stats.skipped = max(0, media_total - stats.downloaded)
-            return stats
-        finally:
+        for index, post in enumerate(posts, 1):
+            before = set(self.download_root.joinpath(username, "Posts").glob("*"))
             try:
-                input_file.unlink(missing_ok=True)
-            except OSError:
-                pass
+                with self._config():
+                    config.set((), "filter", "not video_url")
+                    status = job.DownloadJob(post.post_url).run()
+                after = set(self.download_root.joinpath(username, "Posts").glob("*"))
+                created = [p for p in after - before if p.is_file()]
+                if status:
+                    stats.failed += 1
+                    stats.errors.append(f"{post.shortcode}: gallery-dl status {status}")
+                    print(f"  [{index}/{total}] FAILED {post.shortcode} | remaining={total-index}")
+                else:
+                    stats.downloaded += len(created)
+                    print(f"  [{index}/{total}] {post.shortcode} | media={len(created)} | remaining={total-index}")
+            except Exception as exc:
+                stats.failed += 1
+                stats.errors.append(f"{post.shortcode}: {exc}")
+                print(f"  [{index}/{total}] FAILED {post.shortcode} | remaining={total-index}")
 
-    def download_single_image(self, url: str) -> DownloadStats:
-        if not re.search(r"instagram\.com/(?:p|reel|reels|tv)/[A-Za-z0-9_-]+", url, re.I):
-            raise ValueError("Unsupported Instagram post URL.")
-
-        stats = DownloadStats(scanned=1, candidates=1)
-        args = self._base_args() + [
-            "--download-archive", str(self.archive_file),
-            "--filter", "not video_url",
-            "--retries", "5",
-            "--sleep-retries", "2-8",
-            "--Print", "file:{_path}",
-            url,
-        ]
-        result = self._execute_with_auth_fallback(args, timeout=1800)
-        files = [
-            line.strip()[5:]
-            for line in result.stdout.splitlines()
-            if line.strip().startswith("file:")
-        ]
-        stats.media_total = len(files)
-        stats.downloaded = len(files)
-        if result.returncode != 0:
-            stats.failed = 1
-            stats.errors.append((result.stderr or result.stdout).strip()[-3000:])
+        stats.skipped = max(0, media_total - stats.downloaded)
         return stats
 
-    def inspect_profile(self, value: str) -> ProfileInfo:
+    def download_single_image(self, url):
+        if not re.search(r"instagram\.com/(?:p|reel|reels|tv)/[A-Za-z0-9_-]+", url, re.I):
+            raise ValueError("Unsupported Instagram post URL.")
+        stats = DownloadStats(scanned=1, candidates=1)
+        try:
+            with self._config():
+                config.set((), "filter", "not video_url")
+                status = job.DownloadJob(url).run()
+            if status:
+                stats.failed = 1
+                stats.errors.append(f"gallery-dl status {status}")
+            else:
+                stats.downloaded = 1
+        except Exception as exc:
+            stats.failed = 1
+            stats.errors.append(str(exc))
+        return stats
+
+    def inspect_profile(self, value):
         username = self.normalize_profile(value)
-        records = self._scan_records(self._profile_url(username))
+        records = self._scan(f"https://www.instagram.com/{username}/")
         posts = {
             str(r.get("post_shortcode") or r.get("shortcode"))
             for r in records
             if r.get("post_shortcode") or r.get("shortcode")
         }
-        return ProfileInfo(
-            username=username,
-            posts=len(posts),
-            authenticated=self.auth_mode != "anonymous",
-        )
+        return ProfileInfo(username, len(posts), self.auth_mode != "anonymous")
