@@ -135,27 +135,38 @@ class GalleryDLInstagramEngine:
             return status, data_job.data
 
     def _run_data_with_auth(self, url: str):
+        first = None
         try:
             status, data = self._run_data(url)
-            self.auth_mode = "anonymous"
-            return status, data
-        except Exception as first:
-            if not self._is_auth_error(first):
-                raise
-            last = first
-            for browser in self._browser_variants():
-                try:
-                    with self._config(browser):
-                        data_job = job.DataJob(url, file=None, resolve=0)
-                        status = data_job.run()
+            if status == 0 and data:
+                self.auth_mode = "anonymous"
+                return status, data
+            first = RuntimeError(f"gallery-dl Instagram extraction returned status {status}")
+        except Exception as exc:
+            first = exc
+
+        if not self._is_auth_error(first):
+            raise first
+
+        last = first
+        for browser in self._browser_variants():
+            try:
+                with self._config(browser):
+                    data_job = job.DataJob(url, file=None, resolve=0)
+                    status = data_job.run()
+                    if status == 0 and data_job.data:
                         self.auth_mode = f"browser:{browser[0]}"
                         return status, data_job.data
-                except Exception as exc:
-                    last = exc
-            raise RuntimeError(
-                "Instagram needs access that could not be obtained anonymously or "
-                "from an existing browser session. No Instagram password was requested."
-            ) from last
+                    last = RuntimeError(
+                        f"browser session {browser[0]} returned status {status}"
+                    )
+            except Exception as exc:
+                last = exc
+
+        raise RuntimeError(
+            "Instagram needs access that could not be obtained anonymously or "
+            "from an existing browser session. No Instagram password was requested."
+        ) from last
 
     @staticmethod
     def _records(data):
