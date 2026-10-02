@@ -17,24 +17,46 @@ class InstagramApp:
     def run(self):
         while True:
             print('\n=== Instagram Downloader V2 ===')
-            print('1. Download profile images')
-            print('2. Quick update')
-            print('3. Download single post')
-            print('4. Check Instagram session/profile')
-            print('5. Exit')
+            print('1. Set up Instagram session')
+            print('2. Download profile images')
+            print('3. Quick update')
+            print('4. Download single post')
+            print('5. Check Instagram session/profile')
+            print('6. Exit')
             c=input('Choose: ').strip()
-            if c=='1':
+            if c=='1': self.setup_session()
+            elif c=='2':
                 p=input('Profile URL/username: ').strip()
                 if p: self.run_download(p,self.choose_range())
                 else: print('Profile is required.')
-            elif c=='2':
+            elif c=='3':
                 p=input('Profile URL/username: ').strip()
                 if p: self.run_download(p,RangeSpec('Quick update'))
                 else: print('Profile is required.')
-            elif c=='3': self.run_single(input('Instagram post URL: ').strip())
-            elif c=='4': self.check_profile()
-            elif c=='5': return
+            elif c=='4': self.run_single(input('Instagram post URL: ').strip())
+            elif c=='5': self.check_profile()
+            elif c=='6': return
             else: print('Invalid choice.')
+
+    def setup_session(self):
+        username=input('Instagram username: ').strip().lstrip('@')
+        if not username:
+            print('Username is required.')
+            return
+        try:
+            print('\nInstagram will handle the login interactively.')
+            print('Your password is entered directly into the Instaloader prompt and is not stored in this project.')
+            self.engine.loader.interactive_login(username)
+            if not self.engine.loader.test_login():
+                raise RuntimeError('Instagram login did not produce a valid session.')
+            self.engine.authenticated_as=username
+            session_file=self.engine._session_file(username)
+            self.engine.loader.save_session_to_file(str(session_file))
+            print(f'\nSESSION READY: @{username}')
+            print(f'Saved session: {session_file}')
+            print('You can now use Download profile images.')
+        except Exception as e:
+            print('LOGIN ERROR:', e)
 
     def choose_range(self):
         print('\n1. Last 7 days\n2. Last 1 month\n3. Last 3 months\n4. Last 6 months\n5. Last 1 year\n6. Everything available\n7. Custom dates\n8. Latest N image posts')
