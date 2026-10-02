@@ -103,6 +103,7 @@ class GalleryDLInstagramEngine:
         config.set(("extractor", "instagram"), "videos", False)
         config.set(("extractor", "instagram"), "audio", False)
         config.set(("extractor", "instagram"), "previews", False)
+        config.set(("extractor", "instagram"), "include", "posts")
         if browser:
             name, profile = browser
             config.set((), "cookies", (name, profile, None, None, None))
