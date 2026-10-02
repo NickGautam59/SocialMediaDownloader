@@ -105,8 +105,17 @@ class GalleryDLInstagramEngine:
         config.set(("extractor", "instagram"), "previews", False)
         config.set(("extractor", "instagram"), "include", "posts")
         if browser:
+            # gallery-dl's browser-cookie setting belongs to the Instagram
+            # extractor. The previous implementation incorrectly put a
+            # 5-element tuple in the global "cookies" option, which does not
+            # match gallery-dl's public configuration format.
             name, profile = browser
-            config.set((), "cookies", (name, profile, None, None, None))
+            browser_spec = (name,) if profile is None else (name, profile)
+            config.set(
+                ("extractor", "instagram"),
+                "cookies",
+                [browser_spec],
+            )
         try:
             yield
         finally:
