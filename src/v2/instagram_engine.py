@@ -135,37 +135,60 @@ class GalleryDLInstagramEngine:
             return status, data_job.data
 
     def _run_data_with_auth(self, url: str):
-        first = None
+        # A successful DataJob status does not necessarily mean that Instagram
+        # returned usable post records. Treat an empty result as a failed
+        # anonymous attempt and continue to the browser-session fallback.
+        first_error = None
+        anonymous_status = None
+
         try:
             status, data = self._run_data(url)
+            anonymous_status = status
             if status == 0 and data:
-                self.auth_mode = "anonymous"
-                return status, data
-            first = RuntimeError(f"gallery-dl Instagram extraction returned status {status}")
+                records = list(self._records(data))
+                if records:
+                    self.auth_mode = "anonymous"
+                    return status, data
+                first_error = RuntimeError(
+                    "gallery-dl returned no Instagram post records anonymously"
+                )
+            else:
+                first_error = RuntimeError(
+                    f"gallery-dl Instagram extraction returned status {status}"
+                )
         except Exception as exc:
-            first = exc
+            first_error = exc
 
-        if not self._is_auth_error(first):
-            raise first
+        # Do not gate this on an error-string heuristic. Instagram can return
+        # an empty/non-zero DataJob result when its anonymous endpoint is
+        # restricted, so browser-cookie fallback must always be attempted.
+        last = first_error
 
-        last = first
         for browser in self._browser_variants():
             try:
                 with self._config(browser):
                     data_job = job.DataJob(url, file=None, resolve=0)
                     status = data_job.run()
-                    if status == 0 and data_job.data:
+                    records = list(self._records(data_job.data))
+                    if status == 0 and records:
                         self.auth_mode = f"browser:{browser[0]}"
                         return status, data_job.data
+
                     last = RuntimeError(
-                        f"browser session {browser[0]} returned status {status}"
+                        f"browser session {browser[0]} returned "
+                        f"status {status} with {len(records)} post records"
                     )
             except Exception as exc:
                 last = exc
 
+        detail = (
+            f"anonymous status={anonymous_status}; "
+            f"browser attempts exhausted"
+        )
         raise RuntimeError(
-            "Instagram needs access that could not be obtained anonymously or "
-            "from an existing browser session. No Instagram password was requested."
+            "Instagram profile extraction failed. "
+            "The downloader did not request or store your Instagram password. "
+            f"{detail}. Last error: {last}"
         ) from last
 
     @staticmethod
