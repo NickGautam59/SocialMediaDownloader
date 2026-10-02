@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-import json, re, time
+import json, re, time, os
 from urllib.parse import urlparse
 import browser_cookie3
 import instaloader
@@ -61,25 +61,65 @@ class InstagramEngine:
     def _session_file(self, username): return self.session_dir / f'{username}.session'
 
     def _authenticate(self):
+        # Reuse a previously imported Instaloader session first.
         for session in sorted(self.session_dir.glob('*.session')):
             try:
                 user = session.stem
                 self.loader.load_session_from_file(user, str(session))
                 if self.loader.test_login():
-                    self.authenticated_as = user; return
-            except Exception: pass
-        for name, getter in [('Chrome', browser_cookie3.chrome), ('Edge', browser_cookie3.edge), ('Firefox', browser_cookie3.firefox)]:
-            try:
-                cookies = getter(domain_name='instagram.com')
-                if not cookies: continue
-                self.loader.context._session.cookies.update(cookies)
-                user = self.loader.test_login()
-                if user:
                     self.authenticated_as = user
-                    self.loader.save_session_to_file(str(self._session_file(user)))
                     return
-            except Exception: pass
+            except Exception:
+                pass
+
+        # Import cookies using the same mechanism as current Instaloader.
+        # Brave is explicitly supported, including a common Brave Beta profile path.
+        browsers = [
+            ('Brave', browser_cookie3.brave, self._brave_cookie_files()),
+            ('Chrome', browser_cookie3.chrome, [None]),
+            ('Edge', browser_cookie3.edge, [None]),
+            ('Firefox', browser_cookie3.firefox, [None]),
+        ]
+
+        for name, getter, cookie_files in browsers:
+            for cookie_file in cookie_files:
+                try:
+                    kwargs = {'cookie_file': cookie_file} if cookie_file else {}
+                    browser_cookies = list(getter(**kwargs))
+                    cookies = {
+                        cookie.name: cookie.value
+                        for cookie in browser_cookies
+                        if 'instagram' in cookie.domain
+                    }
+                    if not cookies:
+                        continue
+
+                    self.loader.context.update_cookies(cookies)
+                    user = self.loader.test_login()
+                    if user:
+                        self.authenticated_as = user
+                        self.loader.save_session_to_file(str(self._session_file(user)))
+                        return
+                except Exception:
+                    continue
+
         self.authenticated_as = None
+
+    @staticmethod
+    def _brave_cookie_files():
+        if os.name != 'nt':
+            return [None]
+        local = os.environ.get('LOCALAPPDATA', '')
+        if not local:
+            return [None]
+        candidates = [
+            Path(local) / 'BraveSoftware' / 'Brave-Browser-Beta' / 'User Data' / 'Default' / 'Network' / 'Cookies',
+            Path(local) / 'BraveSoftware' / 'Brave-Browser' / 'User Data' / 'Default' / 'Network' / 'Cookies',
+            Path(local) / 'BraveSoftware' / 'Brave-Browser-Beta' / 'User Data' / 'Default' / 'Cookies',
+            Path(local) / 'BraveSoftware' / 'Brave-Browser' / 'User Data' / 'Default' / 'Cookies',
+        ]
+        existing = [str(p) for p in candidates if p.exists()]
+        return existing or [None]
 
     @staticmethod
     def normalize_profile(v):
@@ -94,7 +134,7 @@ class InstagramEngine:
 
     def _require_auth(self):
         if not self.authenticated_as:
-            raise RuntimeError('Instagram profile access currently requires a logged-in browser session. Log into Instagram in Chrome/Edge/Firefox, close the browser, then run this program again.')
+            raise RuntimeError('Instagram profile access currently requires a logged-in browser session. Log into Instagram in Brave Beta (recommended), Chrome, Edge, or Firefox, fully close the browser, then run this program again.')
 
     def _resolve_user_id(self, username):
         # Fast path: Instaloader's current profile resolver.
