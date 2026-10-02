@@ -105,16 +105,14 @@ class GalleryDLInstagramEngine:
         config.set(("extractor", "instagram"), "previews", False)
         config.set(("extractor", "instagram"), "include", "posts")
         if browser:
-            # gallery-dl's browser-cookie setting belongs to the Instagram
-            # extractor. The previous implementation incorrectly put a
-            # 5-element tuple in the global "cookies" option, which does not
-            # match gallery-dl's public configuration format.
+            # This is the same global cookies tuple used by gallery-dl's
+            # --cookies-from-browser CLI option:
+            # (browser, profile, keyring, container, domain).
             name, profile = browser
-            browser_spec = (name,) if profile is None else (name, profile)
             config.set(
-                ("extractor", "instagram"),
+                (),
                 "cookies",
-                [browser_spec],
+                (name, profile, None, None, None),
             )
         try:
             yield
@@ -139,7 +137,7 @@ class GalleryDLInstagramEngine:
 
     def _run_data(self, url: str):
         with self._config():
-            data_job = job.DataJob(url, file=None, resolve=0)
+            data_job = job.DataJob(url, file=None, resolve=1)
             status = data_job.run()
             return status, data_job.data
 
